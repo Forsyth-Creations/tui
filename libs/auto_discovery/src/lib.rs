@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::env;
 
+
 #[derive(Debug, Clone)]
 pub struct DiscoveredNode {
     pub name: String,
@@ -24,9 +25,11 @@ pub enum Status {
 }
 
 pub struct Node {
-    pub name : String,
+    pub name: String,
     pub status: Arc<Mutex<Status>>,
     pub discovered: Arc<Mutex<HashMap<String, DiscoveredNode>>>,
+    pending_port_range: Option<std::ops::RangeInclusive<u16>>,
+    pending_passcode: Option<String>,
 }
 
 impl Node {
@@ -43,14 +46,44 @@ impl Node {
             },
             Err(_e) => (),
         }
-        Self { name: actual_name, status: Arc::new(Mutex::new(Status::Waiting)), discovered: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            name: actual_name,
+            status: Arc::new(Mutex::new(Status::Waiting)),
+            discovered: Arc::new(Mutex::new(HashMap::new())),
+            pending_port_range: None,
+            pending_passcode: None,
+        }
     }
 
-    pub fn broadcast_existence(&self) {
-        let pairing_code = rand::random_range(0..=9999);
-        let code_str = format!("{:04}", pairing_code);
+    pub fn port_range(&mut self, range: std::ops::RangeInclusive<u16>) -> &mut Self {
+        self.pending_port_range = Some(range);
+        self
+    }
 
-        let listener = TcpListener::bind("0.0.0.0:0").expect("Failed to bind");
+    pub fn passcode(&mut self, code: impl Into<String>) -> &mut Self {
+        self.pending_passcode = Some(code.into());
+        self
+    }
+
+    pub fn broadcast_existence(&mut self) {
+        let code_str = match self.pending_passcode.take() {
+            Some(code) => code,
+            None => format!("{:04}", rand::random_range(0..=9999)),
+        };
+
+        let listener = match self.pending_port_range.take() {
+            None => TcpListener::bind("0.0.0.0:0").expect("Failed to bind"),
+            Some(range) => {
+                let mut bound = None;
+                for port in range {
+                    if let Ok(l) = TcpListener::bind(format!("0.0.0.0:{}", port)) {
+                        bound = Some(l);
+                        break;
+                    }
+                }
+                bound.expect("No ports available in the specified range")
+            }
+        };
         let port = listener.local_addr().unwrap().port();
 
         let mdns = ServiceDaemon::new().expect("Failed to create daemon");
@@ -94,16 +127,42 @@ impl Node {
         let status = Arc::clone(&self.status);
 
         std::thread::spawn(move || {
-            match listener.accept() {
-                Ok((stream, addr)) => {
-                    println!("Connection from {}", addr);
-                    let success = handle_connection(stream, &code_str);
-                    let mut s = status.lock().unwrap();
-                    *s = if success { Status::Connected } else { Status::Failed };
-                }
-                Err(e) => {
-                    eprintln!("Failed to accept connection: {}", e);
-                    *status.lock().unwrap() = Status::Failed;
+            loop {
+                match listener.accept() {
+                    Ok((stream, addr)) => {
+                        println!("Connection from {}", addr);
+                        match handle_connection(stream, &code_str) {
+                            Some(connected) => {
+                                *status.lock().unwrap() = Status::Connected;
+                                let mut reader = BufReader::new(connected);
+                                loop {
+                                    let mut cmd = String::new();
+                                    match reader.read_line(&mut cmd) {
+                                        Ok(0) => {
+                                            println!("Connection closed by peer. Re-broadcasting...");
+                                            break;
+                                        }
+                                        Ok(_) => {
+                                            println!("Command: {}", cmd.trim());
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Read error: {}. Re-broadcasting...", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                *status.lock().unwrap() = Status::Waiting;
+                            }
+                            None => {
+                                // Wrong pairing code — keep listening, status stays Waiting
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to accept connection: {}", e);
+                        *status.lock().unwrap() = Status::Failed;
+                        break;
+                    }
                 }
             }
             mdns.shutdown().unwrap();
@@ -191,29 +250,28 @@ impl Node {
     }
 
 
-    pub fn make_connection(&self, node: &DiscoveredNode, pairing_code: &str) -> Result<(), anyhow::Error> {
+    pub fn make_connection(&self, node: &DiscoveredNode, pairing_code: &str) -> Result<TcpStream, anyhow::Error> {
         use std::io::Write;
 
         let addr = format!("{}:{}", node.address, node.port);
-        println!("Connecting to {} at {}", node.name, addr);
 
         let stream = TcpStream::connect(&addr)?;
         let mut writer = stream.try_clone()?;
-        let mut reader = BufReader::new(&stream);
 
         // Send the pairing code
         writeln!(writer, "{}", pairing_code)?;
 
         // Read response
-        let mut response = String::new();
-        reader.read_line(&mut response)?;
-
-        println!("{:?}", &response);
+        let response = {
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            line
+        };
 
         match response.trim() {
             "OK" => {
-                println!("Pairing successful with {}!", node.name);
-                Ok(())
+                Ok(stream)
             }
             "FAIL" => Err(anyhow::anyhow!("Wrong pairing code")),
             other  => Err(anyhow::anyhow!("Unexpected response: {}", other)),
@@ -222,23 +280,22 @@ impl Node {
 
 }
 
-fn handle_connection(stream: TcpStream, expected_code: &str) -> bool {
+fn handle_connection(stream: TcpStream, expected_code: &str) -> Option<TcpStream> {
     use std::io::Write;
-    let writer = stream.try_clone().expect("Failed to clone stream");
-    let mut reader = BufReader::new(&stream);
-    let mut writer = writer;
+    let mut writer = stream.try_clone().expect("Failed to clone stream");
 
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    let received_code = line.trim();
+    let received = {
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line.trim().to_string()
+    };
 
-    if received_code == expected_code {
-        println!("Pairing successful!");
+    if received == expected_code {
         writeln!(writer, "OK").unwrap();
-        true
+        Some(stream)
     } else {
-        println!("Wrong pairing code, got: {}", received_code);
         writeln!(writer, "FAIL").unwrap();
-        false
+        None
     }
 }
