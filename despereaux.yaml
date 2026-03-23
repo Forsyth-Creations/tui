@@ -1,0 +1,6 @@
+hosts:
+  - galileo
+  - davinci
+  - picaso
+tasks:
+  - sudo reboot

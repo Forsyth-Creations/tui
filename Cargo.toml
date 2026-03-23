@@ -1,0 +1,20 @@
+[workspace]
+members = ["apps/*","libs/*"]
+
+[workspace.dependencies]
+auto_discovery = { path = "libs/auto_discovery" }
+config = { path = "libs/config" }
+
+[package]
+name = "forsyth_tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+config = { version = "0.1.0", path = "libs/config" }
+scheduled = { version = "0.1.0", path = "libs/scheduled" }
+network_functions = { version = "0.1.0", path = "libs/network_functions" }
+auto_discovery = { version = "0.1.0", path = "libs/auto_discovery" }
+crossterm = "0.29.0"
+ratatui = "0.30.0"
+

@@ -1,0 +1,13 @@
+[package]
+name = "auto_discovery"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mdns = "3.0.0"
+futures-util = "0.3.32"
+async-std = "1.13.2"
+mdns-sd = "0.18.2"
+rand = "0.10.0"
+hostname = "0.4.2"
+anyhow = "1.0.102"
