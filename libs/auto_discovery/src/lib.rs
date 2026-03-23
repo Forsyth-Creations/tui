@@ -30,6 +30,7 @@ pub struct Node {
     pub discovered: Arc<Mutex<HashMap<String, DiscoveredNode>>>,
     pending_port_range: Option<std::ops::RangeInclusive<u16>>,
     pending_passcode: Option<String>,
+    tasks: Vec<String>,
 }
 
 impl Node {
@@ -52,7 +53,13 @@ impl Node {
             discovered: Arc::new(Mutex::new(HashMap::new())),
             pending_port_range: None,
             pending_passcode: None,
+            tasks: Vec::new(),
         }
+    }
+
+    pub fn tasks(&mut self, tasks: Vec<String>) -> &mut Self {
+        self.tasks = tasks;
+        self
     }
 
     pub fn port_range(&mut self, range: std::ops::RangeInclusive<u16>) -> &mut Self {
@@ -125,13 +132,14 @@ impl Node {
 
         // Clone the Arc so the thread can update status
         let status = Arc::clone(&self.status);
+        let tasks = self.tasks.clone();
 
         std::thread::spawn(move || {
             loop {
                 match listener.accept() {
                     Ok((stream, addr)) => {
                         println!("Connection from {}", addr);
-                        match handle_connection(stream, &code_str) {
+                        match handle_connection(stream, &code_str, &tasks) {
                             Some(connected) => {
                                 *status.lock().unwrap() = Status::Connected;
                                 let mut reader = BufReader::new(connected);
@@ -250,7 +258,7 @@ impl Node {
     }
 
 
-    pub fn make_connection(&self, node: &DiscoveredNode, pairing_code: &str) -> Result<TcpStream, anyhow::Error> {
+    pub fn make_connection(&self, node: &DiscoveredNode, pairing_code: &str) -> Result<(TcpStream, Vec<String>), anyhow::Error> {
         use std::io::Write;
 
         let addr = format!("{}:{}", node.address, node.port);
@@ -261,18 +269,37 @@ impl Node {
         // Send the pairing code
         writeln!(writer, "{}", pairing_code)?;
 
-        // Read response
-        let response = {
+        // Read response then task list
+        let (response, tasks) = {
             let mut reader = BufReader::new(&stream);
+
             let mut line = String::new();
             reader.read_line(&mut line)?;
-            line
+            let response = line.trim().to_string();
+
+            let tasks = if response == "OK" {
+                let mut count_line = String::new();
+                reader.read_line(&mut count_line)?;
+                let count: usize = count_line.trim()
+                    .strip_prefix("TASKS ")
+                    .ok_or_else(|| anyhow::anyhow!("Expected TASKS line, got: {}", count_line.trim()))?
+                    .parse()?;
+                let mut tasks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut task = String::new();
+                    reader.read_line(&mut task)?;
+                    tasks.push(task.trim().to_string());
+                }
+                tasks
+            } else {
+                Vec::new()
+            };
+
+            (response, tasks)
         };
 
-        match response.trim() {
-            "OK" => {
-                Ok(stream)
-            }
+        match response.as_str() {
+            "OK"   => Ok((stream, tasks)),
             "FAIL" => Err(anyhow::anyhow!("Wrong pairing code")),
             other  => Err(anyhow::anyhow!("Unexpected response: {}", other)),
         }
@@ -280,7 +307,7 @@ impl Node {
 
 }
 
-fn handle_connection(stream: TcpStream, expected_code: &str) -> Option<TcpStream> {
+fn handle_connection(stream: TcpStream, expected_code: &str, tasks: &[String]) -> Option<TcpStream> {
     use std::io::Write;
     let mut writer = stream.try_clone().expect("Failed to clone stream");
 
@@ -293,6 +320,10 @@ fn handle_connection(stream: TcpStream, expected_code: &str) -> Option<TcpStream
 
     if received == expected_code {
         writeln!(writer, "OK").unwrap();
+        writeln!(writer, "TASKS {}", tasks.len()).unwrap();
+        for task in tasks {
+            writeln!(writer, "{}", task).unwrap();
+        }
         Some(stream)
     } else {
         writeln!(writer, "FAIL").unwrap();

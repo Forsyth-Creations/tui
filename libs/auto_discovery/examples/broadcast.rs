@@ -6,6 +6,11 @@ fn main() {
     let param = &args[1];
 
     let mut node = Node::new(param.to_string());
+    node.tasks(vec![
+        "restart".to_string(),
+        "update".to_string(),
+        "status".to_string(),
+    ]);
 
     // Optional: port range as "start-end", e.g. "8000-8100"
     if let Some(range) = args.get(2).and_then(|s| {

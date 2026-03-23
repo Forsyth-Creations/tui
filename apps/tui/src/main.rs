@@ -34,16 +34,38 @@ struct ConnectedNode {
     address: String,
     stream: std::net::TcpStream,
     remote_output: Arc<Mutex<String>>,
+    tasks: Vec<String>,
+    selected_task: usize,
+    task_list_state: ListState,
+}
+
+impl ConnectedNode {
+    fn new(name: String, address: String, stream: std::net::TcpStream, remote_output: Arc<Mutex<String>>, tasks: Vec<String>) -> Self {
+        let mut task_list_state = ListState::default();
+        if !tasks.is_empty() {
+            task_list_state.select(Some(0));
+        }
+        Self { name, address, stream, remote_output, tasks, selected_task: 0, task_list_state }
+    }
+
+    fn next_task(&mut self) {
+        if self.tasks.is_empty() { return; }
+        self.selected_task = (self.selected_task + 1) % self.tasks.len();
+        self.task_list_state.select(Some(self.selected_task));
+    }
+
+    fn prev_task(&mut self) {
+        if self.tasks.is_empty() { return; }
+        self.selected_task = if self.selected_task == 0 { self.tasks.len() - 1 } else { self.selected_task - 1 };
+        self.task_list_state.select(Some(self.selected_task));
+    }
 }
 
 struct App {
     node: Node,
     discovered_nodes: Vec<DiscoveredNode>,
-    tasks: Vec<String>,
     selected_host: usize,    // index into filtered_indices()
     selected_connected: usize,
-    selected_task: usize,
-    task_list_state: ListState,
     active_pane: ActivePane,
     output: String,
     should_quit: bool,
@@ -54,17 +76,12 @@ struct App {
 }
 
 impl App {
-    pub fn new(node: Node, tasks: Vec<String>, initial_nodes: Vec<DiscoveredNode>) -> Self {
-        let mut task_list_state = ListState::default();
-        task_list_state.select(Some(0));
+    pub fn new(node: Node, initial_nodes: Vec<DiscoveredNode>) -> Self {
         Self {
             node,
             discovered_nodes: initial_nodes,
-            tasks,
             selected_host: 0,
             selected_connected: 0,
-            selected_task: 0,
-            task_list_state,
             active_pane: ActivePane::Tasks,
             output: String::new(),
             should_quit: false,
@@ -75,7 +92,6 @@ impl App {
         }
     }
 
-    /// Indices into discovered_nodes that match the current search query.
     fn filtered_indices(&self) -> Vec<usize> {
         if self.search_query.is_empty() {
             (0..self.discovered_nodes.len()).collect()
@@ -119,18 +135,6 @@ impl App {
         if len == 0 { return; }
         if self.selected_connected == 0 { self.selected_connected = len - 1; } else { self.selected_connected -= 1; }
     }
-
-    fn next_task(&mut self) {
-        let next = (self.selected_task + 1) % self.tasks.len();
-        self.selected_task = next;
-        self.task_list_state.select(Some(next));
-    }
-
-    fn prev_task(&mut self) {
-        let prev = if self.selected_task == 0 { self.tasks.len() - 1 } else { self.selected_task - 1 };
-        self.selected_task = prev;
-        self.task_list_state.select(Some(prev));
-    }
 }
 
 fn ui_discovery(frame: &mut ratatui::Frame, app: &mut App) {
@@ -139,22 +143,17 @@ fn ui_discovery(frame: &mut ratatui::Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // node tabs
-            Constraint::Length(3), // search bar
-            Constraint::Min(0),    // node detail
-            Constraint::Length(1), // status bar
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    // --- Node tabs (filtered) ---
     let filtered = app.filtered_indices();
 
     let tab_titles: Vec<Line> = if filtered.is_empty() {
-        let msg = if app.discovered_nodes.is_empty() {
-            " No nodes discovered "
-        } else {
-            " No matches "
-        };
+        let msg = if app.discovered_nodes.is_empty() { " No nodes discovered " } else { " No matches " };
         vec![Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))]
     } else {
         filtered.iter().map(|&i| {
@@ -170,10 +169,8 @@ fn ui_discovery(frame: &mut ratatui::Frame, app: &mut App) {
         .block(Block::default().title("Discovered Nodes").borders(Borders::ALL))
         .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
         .divider("|");
-
     frame.render_widget(tabs, outer[0]);
 
-    // --- Search bar ---
     let is_searching = matches!(app.page, Page::Searching);
     let search_border = if is_searching {
         Style::default().fg(Color::Yellow)
@@ -193,7 +190,6 @@ fn ui_discovery(frame: &mut ratatui::Frame, app: &mut App) {
         .block(Block::default().title("Search").borders(Borders::ALL).border_style(search_border));
     frame.render_widget(search_bar, outer[1]);
 
-    // --- Node detail ---
     let detail_text = if filtered.is_empty() {
         if app.discovered_nodes.is_empty() {
             "No nodes discovered yet.\n\nPress 'r' to rescan.".to_string()
@@ -225,7 +221,6 @@ fn ui_discovery(frame: &mut ratatui::Frame, app: &mut App) {
         .block(Block::default().title("Node Details").borders(Borders::ALL));
     frame.render_widget(detail, outer[2]);
 
-    // --- Status bar ---
     let status = match &app.page {
         Page::Searching => {
             " [Enter] confirm  [Esc] clear & exit search  │  type to filter nodes by name".to_string()
@@ -276,7 +271,6 @@ fn ui_command(frame: &mut ratatui::Frame, app: &mut App) {
         .block(Block::default().title("Connected Nodes").borders(Borders::ALL))
         .highlight_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         .divider("|");
-
     frame.render_widget(tabs, outer[0]);
 
     let content = Layout::default()
@@ -284,9 +278,9 @@ fn ui_command(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(30), Constraint::Min(0)])
         .split(outer[1]);
 
-    let task_items: Vec<ListItem> = app.tasks.iter()
-        .map(|t| ListItem::new(t.clone()))
-        .collect();
+    let task_items: Vec<ListItem> = app.connected_nodes.get(app.selected_connected)
+        .map(|cn| cn.tasks.iter().map(|t| ListItem::new(t.clone())).collect())
+        .unwrap_or_default();
 
     let task_border_style = match app.active_pane {
         ActivePane::Tasks  => Style::default().fg(Color::Green),
@@ -298,7 +292,11 @@ fn ui_command(frame: &mut ratatui::Frame, app: &mut App) {
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Green))
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(task_list, content[0], &mut app.task_list_state);
+    if let Some(cn) = app.connected_nodes.get_mut(app.selected_connected) {
+        frame.render_stateful_widget(task_list, content[0], &mut cn.task_list_state);
+    } else {
+        frame.render_widget(task_list, content[0]);
+    }
 
     let output_border_style = match app.active_pane {
         ActivePane::Output => Style::default().fg(Color::Green),
@@ -307,10 +305,7 @@ fn ui_command(frame: &mut ratatui::Frame, app: &mut App) {
 
     let output_text = match &app.page {
         Page::EnteringSshUser { input, address } => {
-            format!(
-                "SSH into {}\n\nUsername: {}█\n\n[Enter] connect   [Esc] cancel",
-                address, input
-            )
+            format!("SSH into {}\n\nUsername: {}█\n\n[Enter] connect   [Esc] cancel", address, input)
         }
         _ => {
             if let Some(cn) = app.connected_nodes.get(app.selected_connected) {
@@ -351,8 +346,6 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn main() -> io::Result<()> {
-    let main_config = config::Config::new(Some("./despereaux.yaml".to_string())).unwrap();
-
     let node = Node::new("forsyth-tui".to_string());
 
     println!("Running initial scan for 3 seconds...");
@@ -366,7 +359,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(node, main_config.data.tasks.clone(), initial_nodes);
+    let mut app = App::new(node, initial_nodes);
 
     loop {
         terminal.draw(|frame| ui(frame, &mut app))?;
@@ -414,7 +407,7 @@ fn main() -> io::Result<()> {
                                         app.output = format!("{} is already connected.", target.name);
                                     } else {
                                         match app.node.make_connection(&target, &passcode) {
-                                            Ok(stream) => {
+                                            Ok((stream, tasks)) => {
                                                 let reader_stream = stream.try_clone().unwrap();
                                                 let remote_output = Arc::new(Mutex::new(String::new()));
                                                 let output_ref = Arc::clone(&remote_output);
@@ -429,9 +422,14 @@ fn main() -> io::Result<()> {
                                                         }
                                                     }
                                                 });
-                                                let name = target.name.clone();
-                                                let address = target.address.clone();
-                                                app.connected_nodes.push(ConnectedNode { name, address, stream, remote_output });
+                                                let cn = ConnectedNode::new(
+                                                    target.name.clone(),
+                                                    target.address.clone(),
+                                                    stream,
+                                                    remote_output,
+                                                    tasks,
+                                                );
+                                                app.connected_nodes.push(cn);
                                                 app.selected_connected = app.connected_nodes.len() - 1;
                                                 app.output = String::new();
                                                 app.page = Page::Command;
@@ -521,8 +519,18 @@ fn main() -> io::Result<()> {
                             }
                             KeyCode::Right => app.next_connected(),
                             KeyCode::Left  => app.prev_connected(),
-                            KeyCode::Down  => app.next_task(),
-                            KeyCode::Up    => app.prev_task(),
+                            KeyCode::Down  => {
+                                let idx = app.selected_connected;
+                                if let Some(cn) = app.connected_nodes.get_mut(idx) {
+                                    cn.next_task();
+                                }
+                            }
+                            KeyCode::Up => {
+                                let idx = app.selected_connected;
+                                if let Some(cn) = app.connected_nodes.get_mut(idx) {
+                                    cn.prev_task();
+                                }
+                            }
                             KeyCode::Tab => {
                                 app.active_pane = match app.active_pane {
                                     ActivePane::Tasks  => ActivePane::Output,
@@ -530,21 +538,22 @@ fn main() -> io::Result<()> {
                                 };
                             }
                             KeyCode::Enter => {
-                                let task = app.tasks.get(app.selected_task).cloned();
                                 let idx = app.selected_connected;
-                                if let (Some(task), Some(cn)) = (task, app.connected_nodes.get_mut(idx)) {
-                                    use std::io::Write;
-                                    if writeln!(cn.stream, "{}", task).is_ok() {
-                                        app.output = format!("→ {}", task);
-                                    } else {
-                                        let name = cn.name.clone();
-                                        app.connected_nodes.remove(idx);
-                                        if app.selected_connected >= app.connected_nodes.len() && !app.connected_nodes.is_empty() {
-                                            app.selected_connected = app.connected_nodes.len() - 1;
-                                        }
-                                        app.output = format!("Connection to {} lost.", name);
-                                        if app.connected_nodes.is_empty() {
-                                            app.page = Page::Discovery;
+                                if let Some(cn) = app.connected_nodes.get_mut(idx) {
+                                    if let Some(task) = cn.tasks.get(cn.selected_task).cloned() {
+                                        use std::io::Write;
+                                        if writeln!(cn.stream, "{}", task).is_ok() {
+                                            app.output = format!("→ {}", task);
+                                        } else {
+                                            let name = cn.name.clone();
+                                            app.connected_nodes.remove(idx);
+                                            if app.selected_connected >= app.connected_nodes.len() && !app.connected_nodes.is_empty() {
+                                                app.selected_connected = app.connected_nodes.len() - 1;
+                                            }
+                                            app.output = format!("Connection to {} lost.", name);
+                                            if app.connected_nodes.is_empty() {
+                                                app.page = Page::Discovery;
+                                            }
                                         }
                                     }
                                 }
@@ -556,7 +565,6 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Launch SSH outside the TUI event loop so we can cleanly suspend/resume the terminal.
         if let Some((user, addr)) = app.pending_ssh.take() {
             disable_raw_mode()?;
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
