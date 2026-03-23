@@ -20,9 +20,14 @@ enum ActivePane {
     Output,
 }
 
+enum AppMode {
+    Normal,
+    EnteringPasscode { input: String },
+}
+
 struct App {
     node: Node,
-    discovered_nodes: Vec<DiscoveredNode>,  // Changed: store discovered nodes here
+    discovered_nodes: Vec<DiscoveredNode>,
     tasks: Vec<String>,
     selected_host: usize,
     selected_task: usize,
@@ -30,7 +35,8 @@ struct App {
     active_pane: ActivePane,
     output: String,
     should_quit: bool,
-    last_scan: std::time::Instant,  // Track when we last scanned
+    last_scan: std::time::Instant,
+    mode: AppMode,
 }
 
 impl App {
@@ -48,6 +54,7 @@ impl App {
             output: String::new(),
             should_quit: false,
             last_scan: std::time::Instant::now(),
+            mode: AppMode::Normal,
         }
     }
 
@@ -158,10 +165,22 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let selected_node_info = if app.discovered_nodes.is_empty() {
         "No nodes discovered yet.\n\nPress 'r' to rescan or make sure other nodes are running broadcast_existence().".to_string()
     } else if let Some(node) = app.discovered_nodes.get(app.selected_host) {
-        format!(
-            "Node:    {}\nAddress: {}\nPort:    {}\nCode:    {}\n\n{}",
-            node.name, node.address, node.port, node.pairing_code, app.output
-        )
+        let base = format!(
+            "Node:    {}\nAddress: {}\nPort:    {}\n",
+            node.name, node.address, node.port
+        );
+        match &app.mode {
+            AppMode::EnteringPasscode { input } => {
+                format!("{}
+Enter pairing code (shown on the target device):
+  > {}█
+
+[Enter] confirm   [Esc] cancel", base, input)
+            }
+            AppMode::Normal => {
+                format!("{}\n{}", base, app.output)
+            }
+        }
     } else {
         app.output.clone()
     };
@@ -176,11 +195,18 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         .map(|h| h.name.clone())
         .unwrap_or_else(|| "none".to_string());
 
-    let status = format!(
-        " [←/→] switch node  [↑/↓] select task  [Enter] connect  [r] rescan  [Tab] focus  [q] quit  │  node: {} │  nodes: {}",
-        host_label,
-        app.discovered_nodes.len()
-    );
+    let status = match &app.mode {
+        AppMode::EnteringPasscode { .. } => {
+            " [Enter] confirm passcode  [Esc] cancel  │  type the pairing code shown on the target device".to_string()
+        }
+        AppMode::Normal => {
+            format!(
+                " [←/→] switch node  [↑/↓] select task  [Enter] connect  [r] rescan  [Tab] focus  [q] quit  │  node: {} │  nodes: {}",
+                host_label,
+                app.discovered_nodes.len()
+            )
+        }
+    };
     let status_bar = Paragraph::new(status)
         .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status_bar, outer[2]);
@@ -212,37 +238,73 @@ fn main() -> io::Result<()> {
 
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => app.should_quit = true,
-                    KeyCode::Char('r') => {
-                        app.output = "Rescanning for nodes...".to_string();
-                        app.rescan();
-                        app.output = format!("Rescan complete. Found {} nodes.", app.discovered_nodes.len());
-                    }
-                    KeyCode::Right     => app.next_host(),
-                    KeyCode::Left      => app.prev_host(),
-                    KeyCode::Down      => app.next_task(),
-                    KeyCode::Up        => app.prev_task(),
-                    KeyCode::Tab => {
-                        app.active_pane = match app.active_pane {
-                            ActivePane::Tasks  => ActivePane::Output,
-                            ActivePane::Output => ActivePane::Tasks,
-                        };
-                    }
-                    KeyCode::Enter => {
-                        if let Some(node) = app.discovered_nodes.get(app.selected_host) {
-                            let task = &app.tasks[app.selected_task];
-                            app.output = format!(
-                                "Running '{}' on {}...\n\n(SSH not wired up yet)",
-                                task, node.name
-                            );
-                            // Wire make_connection here when ready:
-                            // app.node.make_connection(&node.name).ok();
-                        } else {
-                            app.output = "No node selected. Press 'r' to rescan.".to_string();
+                match &mut app.mode {
+                    AppMode::EnteringPasscode { input } => {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.mode = AppMode::Normal;
+                                app.output = "Connection cancelled.".to_string();
+                            }
+                            KeyCode::Backspace => {
+                                input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                input.push(c);
+                            }
+                            KeyCode::Enter => {
+                                // Capture what we need before switching mode
+                                let passcode = input.clone();
+                                let node_clone = app.discovered_nodes.get(app.selected_host).cloned();
+                                app.mode = AppMode::Normal;
+                                if let Some(node) = node_clone {
+                                    match app.node.make_connection(&node, &passcode) {
+                                        Ok(_) => {
+                                            app.output = format!(
+                                                "✓ Successfully paired with {}!\n\nReady to run tasks.",
+                                                node.name
+                                            );
+                                        }
+                                        Err(e) => {
+                                            app.output = format!(
+                                                "✗ Failed to connect to {}: {}",
+                                                node.name, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
+                    AppMode::Normal => {
+                        match key.code {
+                            KeyCode::Char('q') => app.should_quit = true,
+                            KeyCode::Char('r') => {
+                                app.output = "Rescanning for nodes...".to_string();
+                                app.rescan();
+                                app.output = format!("Rescan complete. Found {} nodes.", app.discovered_nodes.len());
+                            }
+                            KeyCode::Right     => app.next_host(),
+                            KeyCode::Left      => app.prev_host(),
+                            KeyCode::Down      => app.next_task(),
+                            KeyCode::Up        => app.prev_task(),
+                            KeyCode::Tab => {
+                                app.active_pane = match app.active_pane {
+                                    ActivePane::Tasks  => ActivePane::Output,
+                                    ActivePane::Output => ActivePane::Tasks,
+                                };
+                            }
+                            KeyCode::Enter => {
+                                if app.discovered_nodes.get(app.selected_host).is_some() {
+                                    app.mode = AppMode::EnteringPasscode { input: String::new() };
+                                    app.output = String::new();
+                                } else {
+                                    app.output = "No node selected. Press 'r' to rescan.".to_string();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
