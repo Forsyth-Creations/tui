@@ -3,4 +3,5 @@ hosts:
   - davinci
   - picaso
 tasks:
-  - sudo reboot
+  - ls
+  - pwd
